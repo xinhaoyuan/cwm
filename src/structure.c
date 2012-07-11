@@ -11,6 +11,7 @@
 #define ROLE_ROOT             1
 #define ROLE_CLIENT_CONTAINER 2
 #define ROLE_CLIENT_ORIG      3
+#define ROLE_CLIENT_IGNORE    4
 
 static struct wnd_dict_node_s
 {
@@ -131,30 +132,30 @@ get_geom(xcb_window_t window, xcb_window_t *parent, rect_t rect)
     xcb_get_geometry_cookie_t  geom_cookie;
     xcb_get_geometry_reply_t  *geom;
 
-    tree_cookie = xcb_query_tree(x_conn, window);
-    geom_cookie = xcb_get_geometry(x_conn, window);
+    if (parent) tree_cookie = xcb_query_tree(x_conn, window);
+    if (rect)   geom_cookie = xcb_get_geometry(x_conn, window);
     
-    tree = xcb_query_tree_reply(x_conn, tree_cookie, NULL);
-    if (tree == NULL) return -1;
-    
-    geom = xcb_get_geometry_reply(x_conn, geom_cookie, NULL);
-    if (geom == NULL)
+    if (parent)
     {
+        if ((tree = xcb_query_tree_reply(x_conn, tree_cookie, NULL)) == NULL)
+        {
+            /* XXX need to stop geom query? */
+            return -1;
+        }
+        *parent = tree->parent;
         free(tree);
-        return -1;
     }
 
-    if (parent) *parent = tree->parent;
     if (rect)
     {
+        if ((geom = xcb_get_geometry_reply(x_conn, geom_cookie, NULL)) == NULL)
+            return -1;
         rect->x = geom->x;
         rect->y = geom->y;
         rect->w = geom->width;
         rect->h = geom->height;
+        free(geom);
     }
-
-    free(tree);
-    free(geom);
 
     return 0;
 }
@@ -197,7 +198,6 @@ init(void)
         return ret;
     }
 
-    /* Get all screens, but we only process screen 0 now. */
     xcb_screen_iterator_t iter;
     int id;
     
@@ -249,44 +249,49 @@ init(void)
 static int
 setup(void)
 {
-    /* scan all existing window */
-    xcb_get_window_attributes_reply_t *attr;
-    xcb_query_tree_reply_t *reply;
-    
-    reply = xcb_query_tree_reply(x_conn, xcb_query_tree(x_conn, screens[0].xcb_screen->root), 0);
-    if (reply == NULL)
+    int i;
+    for (i = 0; i < screen_count; ++ i)
     {
-        return -1;
-    }
-
-    int i, len = xcb_query_tree_children_length(reply);    
-    xcb_window_t *children = xcb_query_tree_children(reply);
-    
-    for (i = 0; i < len; i ++)
-    {
-        attr = xcb_get_window_attributes_reply(
-            x_conn, xcb_get_window_attributes(x_conn, children[i]), NULL);
-
-        if (attr == NULL)
-        {
-            fprintf(stderr, "Couldn't get attributes for window %d.",
-                    children[i]);
-            continue;
-        }
-
-        /* Ignore windows with override_redirect, or windows that are
-         * not viewable (we would manage then after the expose
-         * event) */
-        if (!attr->override_redirect && attr->map_state == XCB_MAP_STATE_VIEWABLE)
-        {
-            client_create(children[i]);
-        }
         
-        free(attr);
-    }
+        /* scan all existing window */
+        xcb_get_window_attributes_reply_t *attr;
+        xcb_query_tree_reply_t *reply;
+        
+        reply = xcb_query_tree_reply(x_conn, xcb_query_tree(x_conn, screens[i].xcb_screen->root), 0);
+        if (reply == NULL)
+        {
+            return -1;
+        }
 
-    xcb_flush(x_conn);
-    free(reply);
+        int i, len = xcb_query_tree_children_length(reply);    
+        xcb_window_t *children = xcb_query_tree_children(reply);
+    
+        for (i = 0; i < len; i ++)
+        {
+            attr = xcb_get_window_attributes_reply(
+                x_conn, xcb_get_window_attributes(x_conn, children[i]), NULL);
+
+            if (attr == NULL)
+            {
+                fprintf(stderr, "Couldn't get attributes for window %d.",
+                        children[i]);
+                continue;
+            }
+
+            /* Ignore windows with override_redirect, or windows that are
+             * not viewable (we would manage then after the expose
+             * event) */
+            if (!attr->override_redirect && attr->map_state == XCB_MAP_STATE_VIEWABLE)
+            {
+                client_attach(children[i]);
+            }
+        
+            free(attr);
+        }
+
+        xcb_flush(x_conn);
+        free(reply);
+    }
 
     return 0;
 }
@@ -301,7 +306,7 @@ xcb_event_map_request(xcb_generic_event_t *e)
     {
     case ROLE_INIT:
     {
-        client_create(map_request->window);
+        client_attach(map_request->window);
         break;
     }
 
@@ -477,7 +482,7 @@ cleanup(void)
 }
 
 client_t
-client_create(xcb_window_t window)
+client_attach(xcb_window_t window)
 {
     xcb_window_t parent;
     rect_s       geom;
@@ -496,6 +501,7 @@ client_create(xcb_window_t window)
     result->xcb_container = XCB_NONE;
     result->xcb_orig = window;
     result->geom_state = GEOM_STATE_NORMAL;
+    result->mapped = 0;
     
     list_add(&screen->clients, &result->client_node);
 
@@ -516,12 +522,12 @@ client_create(xcb_window_t window)
                       geom.w, geom.h,
                       1,        /* border width */
                       XCB_WINDOW_CLASS_INPUT_OUTPUT,
-                      screens[0].xcb_screen->root_visual,
+                      screen->xcb_screen->root_visual,
                       mask, values);
     result->xcb_container = cont;
     xcb_reparent_window(x_conn, window, cont, 0, 0);
 
-    values[0] = screens[0].inactive_border_pixel;
+    values[0] = screen->inactive_border_pixel;
     xcb_change_window_attributes(x_conn, cont, XCB_CW_BORDER_PIXEL, values);
 
     xcb_grab_button(x_conn, 0, cont, XCB_EVENT_MASK_BUTTON_PRESS,
@@ -532,8 +538,6 @@ client_create(xcb_window_t window)
                     XCB_GRAB_MODE_SYNC, XCB_GRAB_MODE_SYNC, XCB_NONE, XCB_NONE,
                     XCB_BUTTON_INDEX_3, XCB_MOD_MASK_ANY);
 
-    xcb_map_window(x_conn, cont);
-
     node = wnd_dict_find(window, WND_DICT_FIND_OP_TOUCH);
     node->role = ROLE_CLIENT_ORIG;
     node->link = result;
@@ -542,7 +546,31 @@ client_create(xcb_window_t window)
     node->role = ROLE_CLIENT_CONTAINER;
     node->link = result;
 
+    client_map(result);
+
     return result;
+}
+
+void
+client_detach(client_t client)
+{
+    rect_s geom;
+    get_geom(client->xcb_container, NULL, &geom);
+    xcb_reparent_window(x_conn, client->xcb_orig, client->screen->xcb_screen->root, geom.x, geom.y);
+    
+    list_del(&client->client_node);
+    
+    wnd_dict_node_t node = wnd_dict_find(client->xcb_container, WND_DICT_FIND_OP_ERASE);
+    node = wnd_dict_find(client->xcb_orig, WND_DICT_FIND_OP_NONE);
+
+    node->role = ROLE_CLIENT_IGNORE;
+    node->link = NULL;
+
+    if (client->mapped)
+        xcb_map_window(x_conn, client->xcb_orig);
+
+    client_unmap(client);
+    free(client);
 }
 
 void
@@ -555,11 +583,11 @@ client_focus(client_t client)
 
     if (old != NULL)
     {
-        values[0] = screens[0].inactive_border_pixel;
+        values[0] = client->screen->inactive_border_pixel;
         xcb_change_window_attributes(x_conn, old->xcb_container, XCB_CW_BORDER_PIXEL, values);
     }
 
-    values[0] = screens[0].active_border_pixel;
+    values[0] = client->screen->active_border_pixel;
     xcb_change_window_attributes(x_conn, client->xcb_container, XCB_CW_BORDER_PIXEL, values);
     xcb_set_input_focus(x_conn, XCB_INPUT_FOCUS_POINTER_ROOT, client->xcb_orig, XCB_CURRENT_TIME);
 
@@ -572,17 +600,23 @@ client_focus(client_t client)
 void
 client_map(client_t client)
 {
+    if (client->mapped) return;
+    client->mapped = 1;
+    
     xcb_map_window(x_conn, client->xcb_container);
 }
 
 void
 client_unmap(client_t client)
 {
+    if (client->mapped == 0) return;
+    client->mapped = 0;
+    
     if (client->screen->focus == client)
     {
         uint32_t values[1];
 
-        values[0] = screens[0].inactive_border_pixel;
+        values[0] = client->screen->inactive_border_pixel;
         xcb_change_window_attributes(x_conn, client->xcb_container, XCB_CW_BORDER_PIXEL, values);
 
         client->screen->focus = NULL;

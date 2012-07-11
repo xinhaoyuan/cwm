@@ -62,13 +62,15 @@ typedef struct client_s
     xcb_drawable_t xcb_orig;      /* xcb handler */
     
     int geom_state;
+    int mapped;
     
     list_entry_s client_node;
 } client_s;
 
 typedef client_s *client_t;
 
-client_t client_create(xcb_window_t window);
+client_t client_attach(xcb_window_t window);
+void     client_detach(client_t client);
 void     client_focus(client_t client);
 void     client_map(client_t client);
 void     client_unmap(client_t client);
