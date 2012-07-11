@@ -43,9 +43,6 @@ wnd_dict_find(xcb_window_t wnd, int op)
 
     switch (op)
     {
-    case WND_DICT_FIND_OP_NONE:
-        return node;
-        
     case WND_DICT_FIND_OP_TOUCH:
         node = (wnd_dict_node_t)malloc(sizeof(wnd_dict_node_s));
         node->wnd = wnd;
@@ -72,6 +69,9 @@ wnd_dict_find(xcb_window_t wnd, int op)
             free(node);
         }
         return node;
+        
+    default:
+        return node;
     }
 }
 
@@ -88,9 +88,9 @@ static void xcb_event_button_release(xcb_generic_event_t *e);
 
 event_handler_t event_handlers[LASTEvent] =
 {
-    [XCB_MAP_REQUEST] = xcb_event_map_request,
-    [XCB_BUTTON_PRESS] = xcb_event_button_press,
-    [XCB_MOTION_NOTIFY] = xcb_event_motion_notify,
+    [XCB_MAP_REQUEST]    = xcb_event_map_request,
+    [XCB_BUTTON_PRESS]   = xcb_event_button_press,
+    [XCB_MOTION_NOTIFY]  = xcb_event_motion_notify,
     [XCB_BUTTON_RELEASE] = xcb_event_button_release,
 };
 
@@ -600,4 +600,6 @@ main(int argc, char *argv[])
     if (ret == 0) ret = setup();
     if (ret == 0) eventloop();
     cleanup();
+
+    return ret;
 }
