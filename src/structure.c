@@ -83,6 +83,7 @@ wnd_dict_find(xcb_window_t wnd, int op)
 typedef void(*event_handler_t)(xcb_generic_event_t *e);
 
 static void xcb_event_map_request(xcb_generic_event_t *e);
+static void xcb_event_destroy_notify(xcb_generic_event_t *e);
 static void xcb_event_button_press(xcb_generic_event_t *e);
 static void xcb_event_motion_notify(xcb_generic_event_t *e);
 static void xcb_event_button_release(xcb_generic_event_t *e);
@@ -90,6 +91,7 @@ static void xcb_event_button_release(xcb_generic_event_t *e);
 event_handler_t event_handlers[LASTEvent] =
 {
     [XCB_MAP_REQUEST]    = xcb_event_map_request,
+    [XCB_DESTROY_NOTIFY] = xcb_event_destroy_notify,
     [XCB_BUTTON_PRESS]   = xcb_event_button_press,
     [XCB_MOTION_NOTIFY]  = xcb_event_motion_notify,
     [XCB_BUTTON_RELEASE] = xcb_event_button_release,
@@ -98,6 +100,8 @@ event_handler_t event_handlers[LASTEvent] =
 static xcb_connection_t *x_conn = NULL;
 static int screen_count = 0;
 static screen_t screens = NULL;
+
+static void client_free(client_t client);
 
 #define DYN_STRING(string_const)                                        \
     ({ char *r = (char *)malloc(sizeof(string_const));                  \
@@ -311,9 +315,32 @@ xcb_event_map_request(xcb_generic_event_t *e)
     }
 
     case ROLE_CLIENT_CONTAINER:
+    case ROLE_CLIENT_ORIG:
+    case ROLE_CLIENT_IGNORE:
+        break;
+    }
+}
+
+static void
+xcb_event_destroy_notify(xcb_generic_event_t *e)
+{
+    xcb_destroy_notify_event_t *destroy_notify = (xcb_destroy_notify_event_t *)e;
+    wnd_dict_node_t node = wnd_dict_find(destroy_notify->window, WND_DICT_FIND_OP_NONE);
+
+    if (node == NULL ||
+        (node->role != ROLE_CLIENT_ORIG &&
+         node->role != ROLE_CLIENT_IGNORE))
+        return;
+    
+    client_t client = (client_t)node->link;
+    switch (node->role)
+    {
+    case ROLE_CLIENT_ORIG:
+        client_free(client);
         break;
 
-    case ROLE_CLIENT_ORIG:
+    case ROLE_CLIENT_IGNORE:
+        wnd_dict_find(destroy_notify->window, WND_DICT_FIND_OP_ERASE);
         break;
     }
 }
@@ -484,12 +511,19 @@ cleanup(void)
 client_t
 client_attach(xcb_window_t window)
 {
+    wnd_dict_node_t node = wnd_dict_find(window, WND_DICT_FIND_OP_NONE);
+    if (node && node->role != ROLE_CLIENT_IGNORE)
+    {
+        /* Allow detached window to reattach */
+        return NULL;
+    }
+    
     xcb_window_t parent;
     rect_s       geom;
     
     get_geom(window, &parent, &geom);
 
-    wnd_dict_node_t node = wnd_dict_find(parent, WND_DICT_FIND_OP_NONE);
+    node = wnd_dict_find(parent, WND_DICT_FIND_OP_NONE);
     if (node == NULL || node->role != ROLE_ROOT)
         return NULL;
 
@@ -557,19 +591,32 @@ client_detach(client_t client)
     rect_s geom;
     get_geom(client->xcb_container, NULL, &geom);
     xcb_reparent_window(x_conn, client->xcb_orig, client->screen->xcb_screen->root, geom.x, geom.y);
-    
-    list_del(&client->client_node);
-    
+
+    int m = client->mapped;
+    client_unmap(client);
+        
     wnd_dict_node_t node = wnd_dict_find(client->xcb_container, WND_DICT_FIND_OP_ERASE);
     node = wnd_dict_find(client->xcb_orig, WND_DICT_FIND_OP_NONE);
 
     node->role = ROLE_CLIENT_IGNORE;
     node->link = NULL;
 
-    if (client->mapped)
+    if (m)
         xcb_map_window(x_conn, client->xcb_orig);
 
+    list_del(&client->client_node);
+    free(client);
+}
+
+static void
+client_free(client_t client)
+{
     client_unmap(client);
+
+    wnd_dict_find(client->xcb_container, WND_DICT_FIND_OP_ERASE);
+    wnd_dict_find(client->xcb_orig, WND_DICT_FIND_OP_ERASE);
+
+    list_del(&client->client_node);
     free(client);
 }
 
