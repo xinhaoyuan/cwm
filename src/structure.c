@@ -1,6 +1,8 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <signal.h>
+#include <sys/select.h>
 
 #include "structure.h"
 
@@ -100,6 +102,7 @@ event_handler_t event_handlers[LASTEvent] =
 static xcb_connection_t *x_conn = NULL;
 static int screen_count = 0;
 static screen_t screens = NULL;
+static int processing_flag = 1;
 
 static void client_free(client_t client);
 
@@ -164,11 +167,26 @@ get_geom(xcb_window_t window, xcb_window_t *parent, rect_t rect)
     return 0;
 }
 
+static void
+sigcatch(int signal)
+{
+    processing_flag = 0;
+}
+
 static int
 init(void)
 {
     int ret = 0;
     int i;
+
+    if (signal(SIGCHLD, SIG_IGN) == SIG_ERR)
+        return -1;
+
+    if (signal(SIGINT, sigcatch) == SIG_ERR)
+        return -1;
+
+    if (signal(SIGTERM, sigcatch) == SIG_ERR)
+        return -1;
 
     for (i = 0; i < HASH_MOD; ++ i) wnd_hash_list[i] = NULL;
         
@@ -484,10 +502,22 @@ static void
 eventloop(void)
 {
     xcb_generic_event_t *e;
-    while (1)
+    /* Use select to get signal, learnt from MCWM */    
+    int fd;
+    fd_set in;
+
+    fd = xcb_get_file_descriptor(x_conn);
+    FD_ZERO(&in);
+    FD_SET(fd, &in);
+    
+    while (processing_flag && !xcb_connection_has_error(x_conn))
     {
-        e = xcb_wait_for_event(x_conn);
-        if (e == NULL) continue;
+        e = xcb_poll_for_event(x_conn);
+        if (e == NULL)
+        {
+            select(fd + 1, &in, NULL, NULL, NULL);
+            continue;
+        }
 
         event_handler_t h = event_handlers[e->response_type & ~0x80];
         if (h) h(e);
@@ -500,8 +530,25 @@ eventloop(void)
 static int
 cleanup(void)
 {
-    if (screens)
-        free(screens);
+    if (screens && !xcb_connection_has_error(x_conn))
+    {
+        /* Detach all clients */
+        int i;
+        list_entry_t cur;
+        for (i = 0; i < screen_count; ++ i)
+        {
+            cur = list_next(&screens[i].clients);
+            while (cur != &screens[i].clients)
+            {
+                client_t client = CONTAINER_OF(cur, client_s, client_node);
+                client_detach(client);
+
+                cur = list_next(cur);
+            }
+            xcb_flush(x_conn);
+        }
+    }
+
     if (x_conn)
         xcb_disconnect(x_conn);
     
