@@ -1,6 +1,6 @@
 .PHONY: all 
 
-T_CC_FLAGS       ?= $(shell pkg-config --cflags xcb) -std=c99 -Wall 
+T_CC_FLAGS       ?= $(shell pkg-config --cflags xcb) -std=c99 -Wall -I ../see/src
 T_CC_OPT_FLAGS   ?= -O0
 T_CC_DEBUG_FLAGS ?= -g
 T_LD_FLAGS       ?= $(shell pkg-config --libs xcb)
@@ -13,6 +13,6 @@ all: ${T_OBJ}/${PRJ}
 
 -include ${DEPFILES}
 
-${T_OBJ}/${PRJ}: ${OBJFILES}
+${T_OBJ}/${PRJ}: ${OBJFILES} ${T_OBJ}/see.a
 	@echo LD $@
-	${CC} ${T_LD_FLAGS} -o $@ ${OBJFILES}
+	${CC} ${T_LD_FLAGS} -o $@ ${OBJFILES} ${T_OBJ}/see.a

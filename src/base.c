@@ -113,10 +113,6 @@ static int processing_flag = 1;
 
 static void client_free(client_t client);
 
-#define DYN_STRING(string_const)                                        \
-    ({ char *r = (char *)malloc(sizeof(string_const));                  \
-        if (r) memcpy(r, string_const, sizeof(string_const)); r; })
-
 #define DEFINE_ATOM(name) [name] = { XCB_NONE, #name, sizeof(#name) - 1 }
 #define ATOM(name) atoms[name].atom
 
@@ -272,7 +268,7 @@ init(void)
         }
     }
 
-    return 0;
+    return hook_init();
 }
 
 static int
@@ -577,6 +573,7 @@ eventloop(void)
     
     while (processing_flag && !xcb_connection_has_error(x_conn))
     {
+        hook_before_external_event();
         e = xcb_poll_for_event(x_conn);
         if (e == NULL)
         {

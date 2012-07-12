@@ -8,6 +8,10 @@
 
 #include "list.h"
 
+#define DYN_STRING(string_const)                                        \
+    ({ char *r = (char *)malloc(sizeof(string_const));                  \
+        if (r) memcpy(r, string_const, sizeof(string_const)); r; })
+
 #ifndef OFFSET_OF
 #define OFFSET_OF(type, member)                                      \
     ((size_t)(&((type *)0)->member))
