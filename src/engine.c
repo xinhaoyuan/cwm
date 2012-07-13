@@ -10,6 +10,7 @@
 interp_s interp;
 object_t event_handler;
 
+#define SYMBOL_EVENT_INIT SYMBOL_BOX(OBJECT_ID_UD_START + 0)
 
 struct simple_stream
 {
@@ -44,6 +45,18 @@ int simple_stream_in(struct simple_stream *stream, int advance)
     }
     return r;
 }
+
+static object_t
+see_string_create(interp_t interp, const char *str, unsigned int len)
+{
+    object_t result = interp_object_new(interp);
+    result->string = xstring_from_cstr(str, len);
+    OBJECT_TYPE_INIT(result, OBJECT_TYPE_STRING);
+
+    return result;
+}
+
+#define SEE_STRING(str) (see_string_create(&interp, str, sizeof(str)))
 
 static object_t
 interp_run_no_escape(interp_t interp)
@@ -122,11 +135,16 @@ typedef struct hook_event_s *hook_event_t;
 static list_entry_s hook_events;
 
 static void
-event_push(unsigned int argc, object_t *args)
+event_push(unsigned int argc, const object_t *args)
 {
     hook_event_t he = malloc(sizeof(hook_event_s));
-    he->argc = argc;
-    he->args = args;
+    if ((he->argc = argc) == 0)
+        he->args = NULL;
+    else
+    {
+        he->args = malloc(sizeof(object_t) * argc);
+        memcpy(he->args, args, sizeof(object_t) * argc);
+    }
     
     list_add_before(&hook_events, &he->node);
 }
@@ -140,6 +158,13 @@ event_pop(void)
     list_del(cur);
 
     return CONTAINER_OF(cur, hook_event_s, node);
+}
+
+static void
+event_free(hook_event_t he)
+{
+    if (he->args) free(he->args);
+    free(he);
 }
 
 int
@@ -190,16 +215,8 @@ hook_init(void)
     if ((event_handler = interp_run_no_escape(&interp))
         == NULL) return -1;
 
-    object_t *args;
-    args = malloc(sizeof(object_t) * 1);
-    args[0] = INT_BOX(1234);
-    event_push(1, args);
+    event_push(1, (const object_t[]){ SYMBOL_EVENT_INIT });
 
-    args = malloc(sizeof(object_t) * 1);
-    args[0] = INT_BOX(4567);
-    event_push(1, args);
-
-    
     return 0;
 }
 
@@ -210,10 +227,7 @@ hook_before_external_event(void)
     while ((he = event_pop()) != NULL)
     {
         interp_apply(&interp, event_handler, he->argc, he->args);
-        
-        if (he->args) free(he->args);
-        free(he);
-
+        event_free(he);
         interp_run_no_escape(&interp);
     }
 }
