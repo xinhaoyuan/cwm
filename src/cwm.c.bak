@@ -4,15 +4,16 @@
 #include <signal.h>
 #include <sys/select.h>
 
-#include "base.h"
+#include "cwm.h"
 
 #define HASH_MOD 19997
 #define HASH_MUL 10007
 
 #define ROLE_INIT             0
 #define ROLE_ROOT             1
-#define ROLE_CLIENT           2
-#define ROLE_CLIENT_IGNORE    3
+#define ROLE_CLIENT_CONTAINER 2
+#define ROLE_CLIENT_ORIG      3
+#define ROLE_CLIENT_IGNORE    4
 
 static struct wnd_dict_node_s
 {
@@ -105,35 +106,11 @@ event_handler_t event_handlers[LASTEvent] =
 };
 
 static xcb_connection_t *x_conn = NULL;
+static int      screen_count = 0;
+static screen_t screens = NULL;
 static int      processing_flag = 1;
 
-int      screen_count = 0;
-screen_t screens = NULL;
-
-static const char *__dcc_class_name_get(client_class_t self) { return "DUMMY"; }
-static int  __dcc_client_try_attach(client_class_t self, client_t client) { return CLIENT_TRY_ATTACH_FAILED; }
-static void __dcc_client_map(client_class_t self, client_t client) { }
-static void __dcc_client_unmap(client_class_t self, client_t client) { }
-static void __dcc_client_detach(client_class_t self, client_t client) { }
-static int  __dcc_client_event_button_press(client_class_t self, client_t client, xcb_button_press_event_t *e) { return CLIENT_INPUT_PASS_THROUGH; }
-static void __dcc_client_event_map_notify(client_class_t self, client_t client, xcb_map_notify_event_t *e) { }
-static void __dcc_client_event_unmap_notify(client_class_t self, client_t client, xcb_unmap_notify_event_t *e) { }
-
-static client_class_s __dummy_client_class =
-{
-    .class_name_get        = __dcc_class_name_get,
-    .client_try_attach     = __dcc_client_try_attach,
-    .client_map            = __dcc_client_map,
-    .client_unmap          = __dcc_client_unmap,
-    .client_detach         = __dcc_client_detach,
-    .client_event_button_press = __dcc_client_event_button_press,
-    .client_event_map_notify   = __dcc_client_event_map_notify,
-    .client_event_unmap_notify = __dcc_client_event_unmap_notify,
-};
-
-static client_t __client_attach(xcb_window_t window);
-static void     __client_detach(client_t client, int forget);
-static void     __client_map(client_t client);
+static void client_free(client_t client);
 
 #define DEFINE_ATOM(name) [name] = { XCB_NONE, #name, sizeof(#name) - 1 }
 #define ATOM(name) atoms[name].atom
@@ -156,7 +133,7 @@ static struct
 };
 
 static int
-__get_geom(xcb_window_t window, xcb_window_t *parent, rect_t rect)
+get_geom(xcb_window_t window, xcb_window_t *parent, rect_t rect)
 {
     xcb_query_tree_cookie_t   tree_cookie;
     xcb_query_tree_reply_t   *tree;
@@ -199,7 +176,7 @@ sigcatch(int signal)
 }
 
 static int
-__init(void)
+init(void)
 {
     int ret = 0;
     int i;
@@ -257,12 +234,13 @@ __init(void)
     for (id = 0; iter.rem; ++ id, xcb_screen_next (&iter))
     {
         screens[id].xcb_screen = iter.data;
-        screens[id].mouse_attached = 0;
-        screens[id].mouse_motion_callback = NULL;
-        screens[id].mouse_release_callback = NULL;
-        screens[id].mouse_cb_data = NULL;
-        list_init(&screens[id].auto_scan_list);
-        list_init(&screens[id].client_list);
+        screens[id].inactive_border_pixel = screens[id].xcb_screen->black_pixel;
+        screens[id].active_border_pixel = screens[id].xcb_screen->white_pixel;
+
+        screens[id].mode = SCREEN_MODE_NORMAL;
+        screens[id].focus = NULL;
+        
+        list_init(&screens[id].clients);
 
         wnd_dict_node_t node = wnd_dict_find(screens[id].xcb_screen->root, WND_DICT_FIND_OP_TOUCH);
         node->role = ROLE_ROOT;
@@ -293,7 +271,7 @@ __init(void)
 }
 
 static int
-__setup(void)
+setup(void)
 {
     int i;
     for (i = 0; i < screen_count; ++ i)
@@ -327,11 +305,9 @@ __setup(void)
             /* Ignore windows with override_redirect, or windows that are
              * not viewable (we would manage then after the expose
              * event) */
-            if (!attr->override_redirect)
+            if (!attr->override_redirect && attr->map_state == XCB_MAP_STATE_VIEWABLE)
             {
-                client_t client = __client_attach(children[i]);
-                if (attr->map_state == XCB_MAP_STATE_VIEWABLE)
-                    __client_map(client);
+                client_map(client_attach(children[i]));
             }
         
             free(attr);
@@ -354,18 +330,15 @@ xcb_event_map_request(xcb_generic_event_t *e)
     {
     case ROLE_INIT:
     {
-        client_t client = __client_attach(map_request->window);
-        __client_map(client);
+        client_map(client_attach(map_request->window));
         break;
     }
 
-    case ROLE_CLIENT:
-    {
-        client_t client = (client_t)node->link;
-        __client_map(client);
+    case ROLE_CLIENT_ORIG:
+        // engine_hook_client_orig_mapped((client_t)node->link);
         break;
-    }
         
+    case ROLE_CLIENT_CONTAINER:
     case ROLE_CLIENT_IGNORE:
         break;
     }
@@ -377,10 +350,10 @@ xcb_event_map_notify(xcb_generic_event_t *e)
     xcb_map_notify_event_t *map_notify = (xcb_map_notify_event_t *)e;
     wnd_dict_node_t node = wnd_dict_find(map_notify->window, WND_DICT_FIND_OP_NONE);
 
-    if (node && node->role == ROLE_CLIENT)
+    if (node && node->role == ROLE_CLIENT_ORIG &&
+        map_notify->event == ((client_t)node->link)->xcb_container)
     {
-        client_t client = (client_t)node->link;
-        client->class->client_event_map_notify(client->class, client, map_notify);
+        // engine_hook_client_orig_mapped((client_t)node->link);
     }
 }
 
@@ -390,10 +363,10 @@ xcb_event_unmap_notify(xcb_generic_event_t *e)
     xcb_unmap_notify_event_t *unmap_notify = (xcb_unmap_notify_event_t *)e;
     wnd_dict_node_t node = wnd_dict_find(unmap_notify->window, WND_DICT_FIND_OP_NONE);
 
-    if (node && node->role == ROLE_CLIENT)
+    if (node && node->role == ROLE_CLIENT_ORIG &&
+        unmap_notify->event == ((client_t)node->link)->xcb_container)
     {
-        client_t client = (client_t)node->link;
-        client->class->client_event_unmap_notify(client->class, client, unmap_notify);
+        // engine_hook_client_orig_unmapped((client_t)node->link);
     }
 }
 
@@ -407,21 +380,21 @@ xcb_event_reparent_notify(xcb_generic_event_t *e)
     wnd_dict_node_t node = wnd_dict_find(reparent_notify->window, WND_DICT_FIND_OP_NONE);
 
     if (node == NULL ||
-        (node->role != ROLE_CLIENT &&
+        (node->role != ROLE_CLIENT_ORIG &&
          node->role != ROLE_CLIENT_IGNORE))
         return;
 
     client_t client = (client_t)node->link;
 
-    switch (node->role)
+    if (node->role == ROLE_CLIENT_ORIG &&
+        reparent_notify->window == client->xcb_container)
     {
-    case ROLE_CLIENT:
-        __client_detach(client, 1);
-        break;
-        
-    case ROLE_CLIENT_IGNORE:
+        client_unmap(client);
+        client_free(client);
+    }
+    else if (node->role == ROLE_CLIENT_IGNORE)
+    {
         wnd_dict_find(reparent_notify->window, WND_DICT_FIND_OP_ERASE);
-        break;
     }
 }
 
@@ -432,16 +405,16 @@ xcb_event_destroy_notify(xcb_generic_event_t *e)
     wnd_dict_node_t node = wnd_dict_find(destroy_notify->window, WND_DICT_FIND_OP_NONE);
 
     if (node == NULL ||
-        (node->role != ROLE_CLIENT &&
+        (node->role != ROLE_CLIENT_ORIG &&
          node->role != ROLE_CLIENT_IGNORE))
         return;
     
     client_t client = (client_t)node->link;
-    
     switch (node->role)
     {
-    case ROLE_CLIENT:
-        __client_detach(client, 1);
+    case ROLE_CLIENT_ORIG:
+        client_unmap(client);
+        client_free(client);
         break;
 
     case ROLE_CLIENT_IGNORE:
@@ -455,15 +428,40 @@ xcb_event_button_press(xcb_generic_event_t *e)
 {
     xcb_button_press_event_t *button_press = (xcb_button_press_event_t *)e;
     wnd_dict_node_t node = wnd_dict_find(button_press->event, WND_DICT_FIND_OP_NONE);
-    int ret = CLIENT_INPUT_PASS_THROUGH;
-
-    if (node && node->role == ROLE_CLIENT)
+    int catch = 0;
+    
+    if (node && node->role == ROLE_CLIENT_CONTAINER)
     {
         client_t client = (client_t)node->link;
-        ret = client->class->client_event_button_press(client->class, client, button_press);
+        screen_t screen = client->screen;
+        
+        if (screen->mode == SCREEN_MODE_NORMAL)
+        {
+            client_focus(client);
+
+            if ((button_press->state & XCB_MOD_MASK_1))
+            {
+                int mode = button_press->detail == XCB_BUTTON_INDEX_1 ?
+                    SCREEN_MODE_MOVE_WINDOW_BY_MOUSE : SCREEN_MODE_RESIZE_WINDOW_BY_MOUSE;
+
+                if ((mode == SCREEN_MODE_RESIZE_WINDOW_BY_MOUSE &&
+                     (client->flags & CLIENT_FLAG_RESIZABLE)) ||
+                    (mode == SCREEN_MODE_MOVE_WINDOW_BY_MOUSE &&
+                     (client->flags & CLIENT_FLAG_MOVABLE)))
+                {
+                    screen_mouse_mode_enter(
+                        client, mode,
+                        button_press->root_x,
+                        button_press->root_y
+                        );
+                    xcb_allow_events(x_conn, XCB_ALLOW_SYNC_POINTER, button_press->time);
+                    catch = 1;
+                }
+            }
+        }
     }
 
-    if (ret == CLIENT_INPUT_PASS_THROUGH)
+    if (catch == 0)
         xcb_allow_events(x_conn, XCB_ALLOW_REPLAY_POINTER, button_press->time);
 }
 
@@ -472,7 +470,6 @@ xcb_event_motion_notify(xcb_generic_event_t *e)
 {
     xcb_motion_notify_event_t *motion_notify = (xcb_motion_notify_event_t *)e;
     wnd_dict_node_t node = wnd_dict_find(motion_notify->root, WND_DICT_FIND_OP_NONE);
-
     if (node == NULL)
         return;
 
@@ -480,8 +477,34 @@ xcb_event_motion_notify(xcb_generic_event_t *e)
     xcb_query_pointer_reply_t *pointer;
     pointer = xcb_query_pointer_reply(x_conn, xcb_query_pointer(x_conn, screen->xcb_screen->root), 0);
 
-    if (screen->mouse_attached && screen->mouse_motion_callback != NULL)
-        screen->mouse_motion_callback(screen->mouse_cb_data, pointer->root_x, pointer->root_y);
+    switch (screen->mode)
+    {
+    case SCREEN_MODE_MOVE_WINDOW_BY_MOUSE:
+    {
+        client_t client = screen->focus;
+        uint32_t values[2];
+        values[0] = screen->mode_pointer_x + pointer->root_x;
+        values[1] = screen->mode_pointer_y + pointer->root_y;
+        xcb_configure_window(x_conn, client->xcb_container,
+                             XCB_CONFIG_WINDOW_X | XCB_CONFIG_WINDOW_Y, values);
+        break;
+    }
+
+    case SCREEN_MODE_RESIZE_WINDOW_BY_MOUSE:
+    {
+        client_t client = screen->focus;
+        uint32_t values[2];
+        int w = screen->mode_pointer_x + pointer->root_x;
+        int h = screen->mode_pointer_y + pointer->root_y;
+        values[0] = w < 32 ? 32 : w;
+        values[1] = h < 32 ? 32 : h;
+        xcb_configure_window(x_conn, client->xcb_container,
+                             XCB_CONFIG_WINDOW_WIDTH | XCB_CONFIG_WINDOW_HEIGHT, values);
+        break;
+    }
+            
+    default: break;
+    }
 
     free(pointer);
 }
@@ -491,22 +514,15 @@ xcb_event_button_release(xcb_generic_event_t *e)
 {
     xcb_button_release_event_t *button_release = (xcb_button_release_event_t *)e;
     wnd_dict_node_t node = wnd_dict_find(button_release->root, WND_DICT_FIND_OP_NONE);
-    
     if (node == NULL)
         return;
 
     screen_t screen = (screen_t)node->link;
-    xcb_query_pointer_reply_t *pointer;
-    pointer = xcb_query_pointer_reply(x_conn, xcb_query_pointer(x_conn, screen->xcb_screen->root), 0);
-
-    if (screen->mouse_attached && screen->mouse_release_callback != NULL)
-        screen->mouse_release_callback(screen->mouse_cb_data, pointer->root_x, pointer->root_y);
-
-    free(pointer);
+    screen_mouse_mode_exit(screen);
 }
 
-static void
-__event_loop(void)
+void
+cwm_eventloop(void)
 {
     xcb_generic_event_t *e;
     /* Use select to get signal, learnt from MCWM */    
@@ -534,8 +550,8 @@ __event_loop(void)
     }
 }
 
-static int
-__cleanup(void)
+int
+cwm_cleanup(void)
 {
     if (screens && !xcb_connection_has_error(x_conn))
     {
@@ -544,11 +560,11 @@ __cleanup(void)
         list_entry_t cur;
         for (i = 0; i < screen_count; ++ i)
         {
-            cur = list_next(&screens[i].client_list);
-            while (cur != &screens[i].client_list)
+            cur = list_next(&screens[i].clients);
+            while (cur != &screens[i].clients)
             {
                 client_t client = CONTAINER_OF(cur, client_s, client_node);
-                __client_detach(client, 1);
+                client_detach(client);
 
                 cur = list_next(cur);
             }
@@ -562,20 +578,20 @@ __cleanup(void)
     return 0;    
 }
 
-static client_t
-__client_attach(xcb_window_t window)
+client_t
+client_attach(xcb_window_t window)
 {
     wnd_dict_node_t node = wnd_dict_find(window, WND_DICT_FIND_OP_NONE);
     if (node && node->role != ROLE_CLIENT_IGNORE)
     {
-        /* Skip attached window */
+        /* Allow detached window to reattach */
         return NULL;
     }
     
     xcb_window_t parent;
     rect_s       geom;
     
-    __get_geom(window, &parent, &geom);
+    get_geom(window, &parent, &geom);
 
     node = wnd_dict_find(parent, WND_DICT_FIND_OP_NONE);
     if (node == NULL || node->role != ROLE_ROOT)
@@ -583,81 +599,185 @@ __client_attach(xcb_window_t window)
 
     screen_t screen = (screen_t)node->link;
 
-    client_t client = (client_t)malloc(sizeof(client_s));
+    client_t result = (client_t)malloc(sizeof(client_s));
     
-    client->screen = screen;
-    client->xcb_window = window;
-    list_add(&screen->client_list, &client->client_node);
+    result->screen = screen;
+    result->xcb_container = XCB_NONE;
+    result->xcb_orig = window;
+    result->mapped = 0;
+    result->flags = CLIENT_FLAG_MOVABLE | CLIENT_FLAG_RESIZABLE;
+    
+    list_add(&screen->clients, &result->client_node);
+
+    /* create a container with border */
+    
+    xcb_window_t cont = xcb_generate_id(x_conn);
+    uint32_t mask     = XCB_CW_OVERRIDE_REDIRECT | XCB_CW_EVENT_MASK;
+    uint32_t values[] = { 1,
+                          XCB_EVENT_MASK_SUBSTRUCTURE_REDIRECT |
+                          XCB_EVENT_MASK_STRUCTURE_NOTIFY |
+                          XCB_EVENT_MASK_SUBSTRUCTURE_NOTIFY };
+    
+    xcb_create_window(x_conn,
+                      XCB_COPY_FROM_PARENT,
+                      cont,
+                      parent,
+                      geom.x, geom.y,
+                      geom.w, geom.h,
+                      1,        /* border width */
+                      XCB_WINDOW_CLASS_INPUT_OUTPUT,
+                      screen->xcb_screen->root_visual,
+                      mask, values);
+    result->xcb_container = cont;
+    xcb_reparent_window(x_conn, window, cont, 0, 0);
+
+    values[0] = screen->inactive_border_pixel;
+    xcb_change_window_attributes(x_conn, cont, XCB_CW_BORDER_PIXEL, values);
+
+    xcb_grab_button(x_conn, 0, cont, XCB_EVENT_MASK_BUTTON_PRESS,
+                    XCB_GRAB_MODE_SYNC, XCB_GRAB_MODE_SYNC, XCB_NONE, XCB_NONE,
+                    XCB_BUTTON_INDEX_1, XCB_MOD_MASK_ANY);
+
+    xcb_grab_button(x_conn, 0, cont, XCB_EVENT_MASK_BUTTON_PRESS,
+                    XCB_GRAB_MODE_SYNC, XCB_GRAB_MODE_SYNC, XCB_NONE, XCB_NONE,
+                    XCB_BUTTON_INDEX_3, XCB_MOD_MASK_ANY);
 
     node = wnd_dict_find(window, WND_DICT_FIND_OP_TOUCH);
-    node->role = ROLE_CLIENT;
-    node->link = client;
+    node->role = ROLE_CLIENT_ORIG;
+    node->link = result;
 
-    client->class = &__dummy_client_class;
+    node = wnd_dict_find(cont, WND_DICT_FIND_OP_TOUCH);
+    node->role = ROLE_CLIENT_CONTAINER;
+    node->link = result;
 
-    list_entry_t cur = list_next(&screen->auto_scan_list);
-    while (cur != &screen->auto_scan_list)
-    {
-        client_class_t class = CONTAINER_OF(cur, client_class_s, auto_scan_node);
-        if (class->client_try_attach(class, client) == CLIENT_TRY_ATTACH_ATTACHED)
-            break;
-        cur = list_next(cur);
-    }
-
-    DEBUGP("client: %08x attached to class: %s\n", window, client->class->class_name_get(client->class));
-    
-    return client;
+    return result;
 }
 
-static void
-__client_detach(client_t client, int forget)
+void
+client_detach(client_t client)
 {
-    client->class->client_detach(client->class, client);
+    rect_s geom;
+    get_geom(client->xcb_container, NULL, &geom);
+    xcb_reparent_window(x_conn, client->xcb_orig, client->screen->xcb_screen->root, geom.x, geom.y);
 
-    if (forget)
-    {
-        wnd_dict_find(client->xcb_window, WND_DICT_FIND_OP_ERASE);
-    }
-    else
-    {
-        wnd_dict_node_t node;
-        node = wnd_dict_find(client->xcb_window, WND_DICT_FIND_OP_NONE);
-        node->role = ROLE_CLIENT_IGNORE;
-        node->link = NULL;
-    }
+    int m = client->mapped;
+    client_unmap(client);
+        
+    wnd_dict_node_t node = wnd_dict_find(client->xcb_container, WND_DICT_FIND_OP_ERASE);
+    node = wnd_dict_find(client->xcb_orig, WND_DICT_FIND_OP_NONE);
+
+    node->role = ROLE_CLIENT_IGNORE;
+    node->link = NULL;
+
+    if (m)
+        xcb_map_window(x_conn, client->xcb_orig);
 
     list_del(&client->client_node);
     free(client);
 }
 
 static void
-__client_map(client_t client)
+client_free(client_t client)
 {
-    client->class->client_map(client->class, client);
+    client_unmap(client);
+
+    wnd_dict_find(client->xcb_container, WND_DICT_FIND_OP_ERASE);
+    wnd_dict_find(client->xcb_orig, WND_DICT_FIND_OP_ERASE);
+
+    list_del(&client->client_node);
+    free(client);
 }
 
 void
-client_class_auto_scan_attach(screen_t screen, client_class_t cc)
+client_focus(client_t client)
 {
-    list_add(&screen->auto_scan_list, &cc->auto_scan_node);
+    uint32_t values[1];
+    
+    client_t old = client->screen->focus;
+    if (old == client) return;
+
+    if (old != NULL)
+    {
+        values[0] = client->screen->inactive_border_pixel;
+        xcb_change_window_attributes(x_conn, old->xcb_container, XCB_CW_BORDER_PIXEL, values);
+    }
+
+    values[0] = client->screen->active_border_pixel;
+    xcb_change_window_attributes(x_conn, client->xcb_container, XCB_CW_BORDER_PIXEL, values);
+    xcb_set_input_focus(x_conn, XCB_INPUT_FOCUS_POINTER_ROOT, client->xcb_orig, XCB_CURRENT_TIME);
+
+    values[0] = XCB_STACK_MODE_ABOVE;
+    xcb_configure_window(x_conn, client->xcb_container, XCB_CONFIG_WINDOW_STACK_MODE, values);
+
+    client->screen->focus = client;
 }
 
 void
-client_class_auto_scan_detach(screen_t screen, client_class_t cc)
+client_map(client_t client)
 {
-    list_del(&cc->auto_scan_node);
+    if (client->mapped) return;
+    client->mapped = 1;
+    
+    xcb_map_window(x_conn, client->xcb_container);
 }
 
-int
-screen_mouse_attach(screen_t screen, mouse_motion_callback_f motion_callback, mouse_release_callback_f release_callback, void *data)
+void
+client_unmap(client_t client)
 {
-    if (screen->mouse_attached)
-        return SCREEN_MOUSE_POINTER_ATTACH_FAILED;
+    if (client->mapped == 0) return;
+    client->mapped = 0;
+    
+    if (client->screen->focus == client)
+    {
+        uint32_t values[1];
 
-    screen->mouse_motion_callback = motion_callback;
-    screen->mouse_release_callback = release_callback;
-    screen->mouse_cb_data = data;
-    screen->mouse_attached = 1;
+        values[0] = client->screen->inactive_border_pixel;
+        xcb_change_window_attributes(x_conn, client->xcb_container, XCB_CW_BORDER_PIXEL, values);
+
+        client->screen->focus = NULL;
+    }
+    
+    xcb_unmap_window(x_conn, client->xcb_container);
+}
+
+void
+client_geom_get(client_t client)
+{
+    get_geom(client->xcb_container, NULL, &client->geom_cache);
+}
+
+void
+client_geom_set(client_t client)
+{
+    uint32_t values[4];
+    values[0] = client->geom_cache.x;
+    values[1] = client->geom_cache.y;
+    values[2] = client->geom_cache.w;
+    values[3] = client->geom_cache.h;
+    xcb_configure_window(x_conn, client->xcb_container,
+                         XCB_CONFIG_WINDOW_X | XCB_CONFIG_WINDOW_Y |
+                         XCB_CONFIG_WINDOW_WIDTH | XCB_CONFIG_WINDOW_HEIGHT,
+                         values);
+}
+
+void
+screen_mouse_mode_enter(client_t client, int mode, int root_x, int root_y)
+{
+    screen_t screen = client->screen;
+    xcb_get_geometry_reply_t *geom = xcb_get_geometry_reply(x_conn, xcb_get_geometry(x_conn, client->xcb_container), NULL);
+    switch (mode)
+    {
+    case SCREEN_MODE_MOVE_WINDOW_BY_MOUSE:
+        screen->mode_pointer_x = geom->x - root_x;
+        screen->mode_pointer_y = geom->y - root_y;
+        break;
+
+    case SCREEN_MODE_RESIZE_WINDOW_BY_MOUSE:
+        screen->mode_pointer_x = geom->width - root_x;
+        screen->mode_pointer_y = geom->height - root_y;
+        break;
+    }
+    free(geom);
 
     xcb_grab_pointer(x_conn, 0, screen->xcb_screen->root,
                      XCB_EVENT_MASK_BUTTON_RELEASE
@@ -669,29 +789,54 @@ screen_mouse_attach(screen_t screen, mouse_motion_callback_f motion_callback, mo
                      XCB_NONE,
                      XCB_CURRENT_TIME);
 
-    return SCREEN_MOUSE_POINTER_ATTACH_ATTACHED;
+    screen->mode = mode;
 }
 
 void
-screen_mouse_detach(screen_t screen)
+screen_mouse_mode_exit(screen_t screen)
 {
-    if (screen->mouse_attached == 0)
-        return;
+    switch (screen->mode)
+    {
+    case SCREEN_MODE_RESIZE_WINDOW_BY_MOUSE:
+    {
+        xcb_get_geometry_reply_t *geom = xcb_get_geometry_reply(x_conn, xcb_get_geometry(x_conn, screen->focus->xcb_container), NULL);
+        uint32_t values[2] = { geom->width, geom->height };
 
-    screen->mouse_attached = 0;
-    xcb_ungrab_pointer(x_conn, XCB_CURRENT_TIME);    
+        xcb_configure_window(x_conn, screen->focus->xcb_orig,
+                             XCB_CONFIG_WINDOW_WIDTH | XCB_CONFIG_WINDOW_HEIGHT, values);
+
+        free(geom);
+        /* no break, same as move window mode */
+    }
+    case SCREEN_MODE_MOVE_WINDOW_BY_MOUSE:
+    {
+        screen->mode = SCREEN_MODE_NORMAL;
+        xcb_ungrab_pointer(x_conn, XCB_CURRENT_TIME);
+        break;
+    }
+            
+    default: break;
+    }
 }
 
+int
+cwm_init()
+{
+    int ret;
+    ret = init();
+    if (ret == 0) ret = setup();
+
+    return ret;
+}
 
 int
 main(void)
 {
     int ret;
     
-    ret = __init();
-    if (ret == 0) __setup();
-    if (ret == 0) __event_loop();
-    ret = __cleanup();
+    ret = cwm_init();
+    if (ret == 0) cwm_eventloop();
+    ret = cwm_cleanup();
 
     return ret;
 }
