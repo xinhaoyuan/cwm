@@ -157,4 +157,3 @@ __list_del(list_entry_t prev, list_entry_t next) {
 }
 
 #endif
-
