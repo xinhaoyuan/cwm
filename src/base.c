@@ -5,7 +5,7 @@
 #include <sys/select.h>
 
 #include "base.h"
-#include "simple_cc.h"
+#include "cc/simple.h"
 
 #define HASH_MOD 19997
 #define HASH_MUL 10007
@@ -503,7 +503,7 @@ static client_t
 __client_attach(xcb_window_t window)
 {
     wnd_dict_node_t node = wnd_dict_find(window, WND_DICT_FIND_OP_NONE);
-    if (node && node->role != WND_ROLE_CLIENT_IGNORE)
+    if (node && node->role == WND_ROLE_CLIENT_IGNORE)
     {
         /* Skip attached window */
         return NULL;
@@ -687,7 +687,7 @@ main(void)
     ret = __init();
     if (ret == 0)
     {
-        simple_cc->init(simple_cc);
+        cc_simple->init(cc_simple);
         __setup();
     }
     if (ret == 0) __event_loop();

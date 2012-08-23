@@ -1,25 +1,29 @@
-#include "base.h"
-#include "simple_cc.h"
+#include "../base.h"
+#include "simple.h"
 
 #include <stdio.h>
 #include <stdlib.h>
 
-typedef struct simple_cc_priv_s *simple_cc_priv_t;
-typedef struct simple_cc_priv_s
+typedef struct cc_simple_priv_s *cc_simple_priv_t;
+typedef struct cc_simple_priv_s
 {
     xcb_window_t xcb_container;
     int mapped;
-} simple_cc_priv_s;
+} cc_simple_priv_s;
 
-typedef struct simple_cc_data_s *simple_cc_data_t;
-typedef struct simple_cc_data_s
+typedef struct cc_simple_data_s *cc_simple_data_t;
+typedef struct cc_simple_data_s
 {
     client_class_s interface;
+
+    uint32_t inactive_border_color;
+    uint32_t active_border_color;
+    
     int      mouse_mode;
     int      mouse_mode_x;
     int      mouse_mode_y;
     client_t mouse_mode_client;
-} simple_cc_data_s;
+} cc_simple_data_s;
 
 #define MOUSE_MODE_NORMAL                 0
 #define MOUSE_MODE_MOVE_WINDOW_BY_MOUSE   1
@@ -28,7 +32,9 @@ typedef struct simple_cc_data_s
 static void
 scc_init(client_class_t self)
 {
-    simple_cc_data_t data = (simple_cc_data_t)self;
+    cc_simple_data_t data = (cc_simple_data_t)self;
+    data->inactive_border_color = screens[0].xcb_screen->black_pixel;
+    data->active_border_color   = screens[0].xcb_screen->white_pixel;
     data->mouse_mode = MOUSE_MODE_NORMAL;
     int i;
     for (i = 0; i < screen_count; ++ i)
@@ -42,7 +48,8 @@ scc_class_name_get(client_class_t self)
 static int
 scc_client_try_attach(client_class_t self, client_t client)
 {
-    simple_cc_priv_t priv = malloc(sizeof(simple_cc_priv_s));
+    cc_simple_data_t data = (cc_simple_data_t)self;
+    cc_simple_priv_t priv = malloc(sizeof(cc_simple_priv_s));
     if (priv == NULL)
         return CLIENT_TRY_ATTACH_FAILED;
     
@@ -71,6 +78,7 @@ scc_client_try_attach(client_class_t self, client_t client)
                       client->screen->xcb_screen->root_visual,
                       mask, values);
     xcb_reparent_window(x_conn, client->xcb_window, priv->xcb_container, 0, 0);
+    xcb_map_window(x_conn, client->xcb_window);
 
     xcb_grab_button(x_conn, 0, priv->xcb_container, XCB_EVENT_MASK_BUTTON_PRESS,
                     XCB_GRAB_MODE_SYNC, XCB_GRAB_MODE_SYNC, XCB_NONE, XCB_NONE,
@@ -79,6 +87,9 @@ scc_client_try_attach(client_class_t self, client_t client)
     xcb_grab_button(x_conn, 0, priv->xcb_container, XCB_EVENT_MASK_BUTTON_PRESS,
                     XCB_GRAB_MODE_SYNC, XCB_GRAB_MODE_SYNC, XCB_NONE, XCB_NONE,
                     XCB_BUTTON_INDEX_3, XCB_MOD_MASK_ANY);
+
+    values[0] = data->inactive_border_color;
+    xcb_change_window_attributes(x_conn, priv->xcb_container, XCB_CW_BORDER_PIXEL, values);
 
     wnd_dict_node_t node = wnd_dict_find(priv->xcb_container, WND_DICT_FIND_OP_TOUCH);
     node->role = WND_ROLE_CLIENT;
@@ -90,7 +101,7 @@ scc_client_try_attach(client_class_t self, client_t client)
 static void
 scc_client_map(client_class_t self, client_t client)
 {
-    simple_cc_priv_t priv = client->priv;
+    cc_simple_priv_t priv = client->priv;
     if (priv->mapped) return;
     priv->mapped = 1;
     
@@ -100,7 +111,7 @@ scc_client_map(client_class_t self, client_t client)
 static void
 scc_client_unmap(client_class_t self, client_t client)
 {
-    simple_cc_priv_t priv = client->priv;
+    cc_simple_priv_t priv = client->priv;
     if (priv->mapped == 0) return;
     priv->mapped = 0;
     
@@ -112,8 +123,8 @@ static void scc_mouse_release_callback(void *__data);
 static void
 scc_client_detach(client_class_t self, client_t client, int keep_mapped)
 {
-    simple_cc_data_t data = (simple_cc_data_t)self;
-    simple_cc_priv_t priv = client->priv;
+    cc_simple_data_t data = (cc_simple_data_t)self;
+    cc_simple_priv_t priv = client->priv;
     rect_s geom;
 
     if (data->mouse_mode != MOUSE_MODE_NORMAL && data->mouse_mode_client == client)
@@ -134,9 +145,9 @@ scc_client_detach(client_class_t self, client_t client, int keep_mapped)
 static void
 scc_mouse_motion_callback(void *__data, int abs_x, int abs_y)
 {
-    simple_cc_data_t data = (simple_cc_data_t)__data;
+    cc_simple_data_t data = (cc_simple_data_t)__data;
     client_t client = data->mouse_mode_client;
-    simple_cc_priv_t priv = client->priv;
+    cc_simple_priv_t priv = client->priv;
 
     switch (data->mouse_mode)
     {
@@ -169,9 +180,9 @@ scc_mouse_motion_callback(void *__data, int abs_x, int abs_y)
 static void
 scc_mouse_release_callback(void *__data)
 {
-    simple_cc_data_t data = (simple_cc_data_t)__data;
+    cc_simple_data_t data = (cc_simple_data_t)__data;
     client_t client = data->mouse_mode_client;
-    simple_cc_priv_t priv = client->priv;
+    cc_simple_priv_t priv = client->priv;
 
     switch (data->mouse_mode)
     {
@@ -201,8 +212,8 @@ scc_mouse_release_callback(void *__data)
 static int
 scc_client_event_button_press(client_class_t self, client_t client, xcb_button_press_event_t *button_press)
 {
-    simple_cc_data_t data = (simple_cc_data_t)self;
-    simple_cc_priv_t priv = client->priv;
+    cc_simple_data_t data = (cc_simple_data_t)self;
+    cc_simple_priv_t priv = client->priv;
 
     focus_set(client);
     
@@ -253,17 +264,28 @@ static void
 scc_client_aevent_focus(client_class_t self, client_t client)
 {
     uint32_t values[1];
-    simple_cc_priv_t priv = client->priv;
+    cc_simple_data_t data = (cc_simple_data_t)self;
+    cc_simple_priv_t priv = client->priv;
     
     values[0] = XCB_STACK_MODE_ABOVE;
     xcb_configure_window(x_conn, priv->xcb_container, XCB_CONFIG_WINDOW_STACK_MODE, values);
+
+    values[0] = data->active_border_color;
+    xcb_change_window_attributes(x_conn, priv->xcb_container, XCB_CW_BORDER_PIXEL, values);
 }
 
 static void
 scc_client_aevent_blur(client_class_t self, client_t client)
-{ }
+{
+    uint32_t values[1];
+    cc_simple_data_t data = (cc_simple_data_t)self;
+    cc_simple_priv_t priv = client->priv;
 
-simple_cc_data_s __simple_cc = 
+    values[0] = data->inactive_border_color;
+    xcb_change_window_attributes(x_conn, priv->xcb_container, XCB_CW_BORDER_PIXEL, values);
+}
+
+cc_simple_data_s __cc_simple = 
 {
     .interface = 
     {
@@ -282,4 +304,4 @@ simple_cc_data_s __simple_cc =
     },
 };
 
-client_class_t simple_cc = (client_class_t)&__simple_cc;
+client_class_t cc_simple = (client_class_t)&__cc_simple;
